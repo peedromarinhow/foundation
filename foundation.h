@@ -26,10 +26,13 @@
 #define fornum(i, n)    for (u64 (i) = 0;   (i) < (n); (i) += 1)
 #define forran(i, s, e) for (u64 (i) = (s); (i) < (e); (i) += 1)
 
-#ifdef __cplusplus
-  #define function static
-#endif
 #define function
+
+#if defined(_WIN32)
+  #define dll_export __declspec(dllexport)
+#else
+  #define dll_export
+#endif
 
 #if defined(DEBUG)
   #define Assert(Expr, ...)                                   \
@@ -91,10 +94,15 @@ typedef double f64;
 
 typedef void proc(void);
 
-#include <emmintrin.h>
-typedef __m128  m128;
-typedef __m128i u128;
-typedef __m128i i128;
+#include <immintrin.h>
+
+typedef union _f32v2 {
+  struct {f32 x, y;};
+  struct {f32 u, v;};
+} f32v2;
+
+#define AddV2(A, B) {(A).x + (B).x, (A).y + (B).y}
+#define SubV2(A, B) {(A).x - (B).x, (A).y - (B).y}
 
 function u64 HashU64(u64 x);
 function u64 HashStr(c8 *Str, u32 Len);
@@ -113,17 +121,11 @@ function void MemCpy(byte *Dst, const byte *Src, u64 Len);
 typedef struct _pool {
 	u64 Cap;
 	u64 Pos;
-
-#ifdef __cplusplus
-  inline void  Release(void);
-  inline void *Put(u64 Size);
-  inline void  Pop(u64 Size);
-#endif
 } pool;
 function pool *ReservePool(void);
-inline void    ReleasePool(pool *p);
-inline void   *PoolPut(pool *p, u64 Size);
-inline void    PoolPop(pool *p, u64 Size);
+inline   void  ReleasePool(pool *p);
+inline   void *PoolPut(pool *p, u64 Size);
+inline   void  PoolPop(pool *p, u64 Size);
 
 typedef struct _str {
   c8 *Str;
@@ -131,23 +133,23 @@ typedef struct _str {
 } str;
 #define StrLit(Lit) (str){Lit, sizeof(Lit)-1}
 
-#define ARRAY_INIT_CAP 16
-#define array(type) struct { u64 Cap, Len; type *Mem; }
+struct _arr_hdr {
+  u64 Len;
+  u64 Cap;
+  c8  Arr[0];
+};
 
-function b32 _ArrayMake(u64 *Cap, u64 *Len, u64 Itm, void **Mem, u64 InitCap);
-function b32 _ArrayGrow(u64 *Cap, u64 *Len, u64 Itm, void **Mem);
+#define _ArrHdr(a)    ((struct _arr_hdr*)((byte*)a - offsetof(struct _arr_hdr, Arr)))
+#define _ArrCan(a, n) (ArrLen(a) + (n) <= ArrCap(a))
+#define  ArrFit(a, n) (_ArrCan((a), (n)) ? 0 : ((a) = _ArrGrow((a), ArrLen(a) + (n), sizeof(*(a)))))
+#define  ArrLen(a)    ((a) ? _ArrHdr(a)->Len : 0)
+#define  ArrCap(a)    ((a) ? _ArrHdr(a)->Cap : 0)
+#define  ArrEnd(a)    ((a) ? &(a)[_ArrHdr(a)->Len] : 0)
+#define  ArrAdd(a, x) (ArrFit(a, 1), (a)[_ArrHdr(a)->Len++] = (x))
+#define  ArrCpy(a, p) (ArrFit(a, 1), memcpy(&(a)[_ArrHdr(a)->Len++], p, sizeof(*p)))
 
-#define _ArrayExp(Array) &(Array)->Cap, &(Array)->Len, sizeof(*(Array)->Mem), (void**)(&(Array)->Mem) 
-#define  ArrayMake(Array, Len) _ArrayMake(_ArrayExp(Array), (Len))
-#define  ArrayFree(Array) MemRel((Array)->Mem, (Array)->Cap*sizeof(*(Array)->Mem)), (Array)->Cap = 0, (Array)->Len = 0, (Array)->Mem = null
-#define  ArrayAdd(Array, x) (        \
-  ((Array)->Cap < (Array)->Len + 1)? \
-    _ArrayGrow(_ArrayExp(Array))     \
-  :                                  \
-    0,                               \
-  (Array)->Mem[(Array)->Len] = (x),  \
-  (Array)->Len++                     \
-)
+function void *_ArrGrow(void *a, u64 NewLen, u64 Elm);
+inline void *PoolPutArr(pool *p, u64 Len, u64 Elm);
 
 //.link: https://youtu.be/k9MBMvR2IvI;
 //.link: https://github.com/pervognsen/bitwise.
@@ -178,6 +180,7 @@ inline u64 GetUsecs(void);
 // FILES
 function str FileOpen(c8 *Path);
 function b32 FileSave(c8 *Path, byte *Data, u32 Size);
+function void FileRel(str File);
 function b32 CreateDir(c8 *Path);
 function b32 DeleteDir(c8 *Path);
 
@@ -288,11 +291,6 @@ inline void PoolPop(pool *p, u64 Size) {
   if (Size < p->Pos)
     p->Pos -= Size;
 }
-#ifdef __cplusplus
-  inline void  pool::Release(void) {ReleasePool(this);}
-  inline void *pool::Put(u64 Size) {return PoolPut(this, Size);}
-  inline void  pool::Pop(u64 Size) {PoolPop(this, Size);}
-#endif
 
 function str StrFmt(c8 *Fmt, ...) {
   va_list Args;
@@ -303,32 +301,26 @@ function str StrFmt(c8 *Fmt, ...) {
   return (str){Buff, Len};
 }
 
-function b32 _ArrayMake(u64 *Cap, u64 *Len, u64 Itm, void **Mem, u64 InitCap) {
-  *Mem = MemRes(Itm*InitCap);
-  *Cap = InitCap;
-  *Len = 0;
-  if (*Mem == null)
-    return false;
-  return true;
+function void *_ArrGrow(void *a, u64 NewLen, u64 Elm) {
+  u64 NewCap = max(1 + 2*ArrCap(a), NewLen);
+  Assert(NewLen <= NewCap);
+  u64 NewTot = NewCap*Elm + offsetof(struct _arr_hdr, Arr);
+  struct _arr_hdr *NewHdr = MemRes(NewTot);
+  if (a) {
+    memcpy(NewHdr->Arr, a, ArrLen(a)*Elm);
+    NewHdr->Len = ArrLen(a);
+    MemRel(a, ArrCap(a)*Elm + offsetof(struct _arr_hdr, Arr));
+  }
+  else
+    NewHdr->Len = 0;
+  NewHdr->Cap = NewCap;
+  return NewHdr->Arr;
 }
-function b32 _ArrayGrow(u64 *Cap, u64 *Len, u64 Itm, void **Mem) {
-  if ((*Mem) == null) {
-    *Mem = MemRes(Itm*ARRAY_INIT_CAP);
-    if ((*Mem) == null)
-      return false;
-  }
-  else {
-    u64   NewCap = ((*Cap) == 0)? 8 : (*Cap) * 2;
-    void *NewMem = MemRes(NewCap*Itm);
-    if (NewMem != null)
-      MemCpy(NewMem, *Mem, (*Len)*Itm);
-    MemRel(*Mem, (*Len)*Itm);
-    if (NewMem == null)
-      return false;
-    *Mem = NewMem;
-    *Cap = NewCap;
-  }
-  return true;
+inline void *PoolPutArr(pool *p, u64 Len, u64 Elm) {
+  struct _arr_hdr *Hdr =
+    PoolPut(p, Len*Elm + offsetof(struct _arr_hdr, Arr));
+  Hdr->Len = Len;
+  return Hdr->Arr;
 }
 
 function b32 _TableMake(u64 *Cap, u64 *Len, u64 **Keys, byte **Vals, u64 Itm, u64 InitCap) {
@@ -433,6 +425,9 @@ function b32 FileSave(c8 *Path, byte *Data, u32 Size) {
     Success = false;
   CloseHandle(File);
   return Success;
+}
+function void FileRel(str File) {
+  MemRel(File.Str, File.Len);
 }
 function b32 CreateDir(c8 *Path) {
   return CreateDirectoryA(Path, 0);
